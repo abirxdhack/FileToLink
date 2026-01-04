@@ -1,19 +1,30 @@
+import os
+import asyncio
+import socket
+import urllib.parse
+from math import ceil, floor
+from mimetypes import guess_type
+from datetime import datetime
+from collections import deque
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Response, Request
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
 from telethon import TelegramClient
+from telethon.sessions import MemorySession
 from telethon.tl.custom import Message
-from datetime import datetime
-from mimetypes import guess_type
-from math import ceil, floor
-from contextlib import asynccontextmanager
-import asyncio
-import urllib.parse
-import socket
-import os
-from collections import deque
-from config import API_ID, API_HASH, BOT_TOKEN, LOG_CHANNEL_ID
-from utils import LOGGER
+
+try:
+    from config import API_ID, API_HASH, BOT_TOKEN, LOG_CHANNEL_ID
+    from utils import LOGGER
+except ImportError:
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    LOGGER = logging.getLogger(__name__)
+    API_ID = os.getenv("API_ID")
+    API_HASH = os.getenv("API_HASH")
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
+    LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
 HEROKU_APP_NAME = os.getenv("HEROKU_APP_NAME")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
@@ -50,7 +61,7 @@ def get_base_url_from_request(request: Request) -> str:
     forwarded_proto = request.headers.get("x-forwarded-proto")
     forwarded_host = request.headers.get("x-forwarded-host")
     host = request.headers.get("host")
-    
+
     if forwarded_host:
         scheme = forwarded_proto or "https"
         return f"{scheme}://{forwarded_host}"
@@ -97,9 +108,16 @@ def get_file_properties(message: Message):
     return file_name, file_size, mime_type
 
 class FileToLinkAPI(TelegramClient):
-    def __init__(self, session_name, api_id, api_hash, bot_token):
-        LOGGER.info("Creating Telethonian FileToLink Client From BOT_TOKEN")
-        super().__init__(session_name, api_id, api_hash, connection_retries=-1, timeout=120, flood_sleep_threshold=0)
+    def __init__(self, api_id, api_hash, bot_token):
+        LOGGER.info("Creating Telethon FileToLink Client From BOT_TOKEN with MemorySession")
+        super().__init__(
+            MemorySession(),
+            api_id,
+            api_hash,
+            connection_retries=-1,
+            timeout=120,
+            flood_sleep_threshold=0
+        )
         self.bot_token = bot_token
         self.request_count = 0
         self.max_concurrent = 100
@@ -107,7 +125,7 @@ class FileToLinkAPI(TelegramClient):
 
     async def start_api(self):
         await self.start(bot_token=self.bot_token)
-        LOGGER.info("Telethonian FileToLink Client Created Successfully!")
+        LOGGER.info("Telethon FileToLink Client Created Successfully with MemorySession!")
         LOGGER.info("FileToLinkAPI started with max concurrent requests: %s", self.max_concurrent)
 
 async def get_local_ip():
@@ -128,37 +146,37 @@ async def detect_base_url():
         base_url = f"https://{CUSTOM_DOMAIN}" if not CUSTOM_DOMAIN.startswith("http") else CUSTOM_DOMAIN
         LOGGER.info(f"Using CUSTOM_DOMAIN: {base_url}")
         return base_url
-    
+
     if HEROKU_APP_NAME:
         base_url = f"https://{HEROKU_APP_NAME}.herokuapp.com"
         LOGGER.info(f"Detected Heroku deployment: {base_url}")
         return base_url
-    
+
     if RENDER_EXTERNAL_URL:
         base_url = RENDER_EXTERNAL_URL.rstrip('/')
         LOGGER.info(f"Detected Render deployment: {base_url}")
         return base_url
-    
+
     if RAILWAY_PUBLIC_DOMAIN:
         base_url = f"https://{RAILWAY_PUBLIC_DOMAIN}"
         LOGGER.info(f"Detected Railway deployment (public domain): {base_url}")
         return base_url
-    
+
     if RAILWAY_STATIC_URL:
         base_url = RAILWAY_STATIC_URL.rstrip('/')
         LOGGER.info(f"Detected Railway deployment (static URL): {base_url}")
         return base_url
-    
+
     if FLY_APP_NAME:
         base_url = f"https://{FLY_APP_NAME}.fly.dev"
         LOGGER.info(f"Detected Fly.io deployment: {base_url}")
         return base_url
-    
+
     if VERCEL_URL:
         base_url = f"https://{VERCEL_URL}"
         LOGGER.info(f"Detected Vercel deployment: {base_url}")
         return base_url
-    
+
     ip = await get_local_ip()
     base_url = f"http://{ip}:{Server.PORT}"
     LOGGER.info(f"No platform detected, using local IP: {base_url}")
@@ -171,12 +189,16 @@ async def lifespan(app: FastAPI):
     LOGGER.info(f"API running on: {Server.BASE_URL}")
     yield
     LOGGER.info("Shutting down API")
+    await api_instance.disconnect()
 
 app = FastAPI(lifespan=lifespan, title="FileToLink")
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    try:
+        return templates.TemplateResponse("index.html", {"request": request})
+    except Exception as e:
+        return HTMLResponse(content=f"<h1>FileToLink API</h1><p>Status: Running</p><p>Error loading template: {str(e)}</p>")
 
 @app.get("/stream/{file_id}", response_class=HTMLResponse)
 async def stream_file(file_id: int, request: Request):
@@ -212,13 +234,16 @@ async def stream_file(file_id: int, request: Request):
         file_url = f"{base_url}/dl/{file_id}?code={quoted_code}"
         file_size_mb = f"{file_size / (1024 * 1024):.2f} MB"
 
-        return templates.TemplateResponse("player.html", {
-            "request": request,
-            "file_name": file_name,
-            "file_size_mb": file_size_mb,
-            "file_url": file_url,
-            "mime_type": mime_type
-        })
+        try:
+            return templates.TemplateResponse("player.html", {
+                "request": request,
+                "file_name": file_name,
+                "file_size_mb": file_size_mb,
+                "file_url": file_url,
+                "mime_type": mime_type
+            })
+        except Exception as e:
+            return HTMLResponse(content=f"<h1>{file_name}</h1><p>Size: {file_size_mb}</p><a href='{file_url}'>Download</a>")
 
 @app.get("/dl/{file_id}")
 async def transmit_file(file_id: int, request: Request):
@@ -257,13 +282,16 @@ async def transmit_file(file_id: int, request: Request):
             file_url = f"{base_url}/dl/{file_id}?code={quoted_code}"
             file_size_mb = f"{file_size / (1024 * 1024):.2f} MB"
 
-            return templates.TemplateResponse("player.html", {
-                "request": request,
-                "file_name": file_name,
-                "file_size_mb": file_size_mb,
-                "file_url": file_url,
-                "mime_type": mime_type
-            })
+            try:
+                return templates.TemplateResponse("player.html", {
+                    "request": request,
+                    "file_name": file_name,
+                    "file_size_mb": file_size_mb,
+                    "file_url": file_url,
+                    "mime_type": mime_type
+                })
+            except Exception as e:
+                return HTMLResponse(content=f"<h1>{file_name}</h1><p>Size: {file_size_mb}</p><a href='{file_url}'>Download</a>")
 
     async with api_instance.semaphore:
         me = await api_instance.get_me()
@@ -306,7 +334,7 @@ async def transmit_file(file_id: int, request: Request):
             LOGGER.error("Invalid range request - Bytes: %s-%s/%s", from_bytes, until_bytes, file_size)
             abort(416, "Invalid range.")
 
-        chunk_size = 4 * 1024 * 1024  
+        chunk_size = 4 * 1024 * 1024
         until_bytes = min(until_bytes, file_size - 1)
         offset = from_bytes - (from_bytes % chunk_size)
         first_part_cut = from_bytes - offset
@@ -395,8 +423,8 @@ async def transmit_file(file_id: int, request: Request):
                 LOGGER.info("API %s processing completed", api_name)
 
         return StreamingResponse(
-            file_generator(), 
-            headers=headers, 
+            file_generator(),
+            headers=headers,
             status_code=206 if range_header else 200,
             media_type=mime_type
         )
@@ -407,7 +435,6 @@ async def http_error(request: Request, exc: HTTPException):
     return Response(content=exc.detail or error_message, status_code=exc.status_code)
 
 api_instance = FileToLinkAPI(
-    session_name="FileToLink",
     api_id=Telegram.API_ID,
     api_hash=Telegram.API_HASH,
     bot_token=Telegram.BOT_TOKEN
@@ -416,13 +443,13 @@ api_instance = FileToLinkAPI(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "__main__:app", 
-        host=Server.BIND_ADDRESS, 
-        port=Server.PORT, 
+        "__main__:app",
+        host=Server.BIND_ADDRESS,
+        port=Server.PORT,
         workers=1,
         loop="uvloop",
-        limit_concurrency=2000,  
-        backlog=4096,  
+        limit_concurrency=2000,
+        backlog=4096,
         timeout_keep_alive=75,
         h11_max_incomplete_event_size=16777216
     )
