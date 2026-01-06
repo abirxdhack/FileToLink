@@ -133,7 +133,6 @@ Integrate the API into a Telegram bot to generate stream and download links for 
 ### Example Code
 ```python
 import asyncio
-import secrets
 import urllib.parse
 from datetime import datetime
 from mimetypes import guess_type
@@ -141,7 +140,6 @@ from aiogram import Bot
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.enums import ParseMode
-from pyrogram.enums import ParseMode as SmartParseMode
 from pyrogram.types import Message as SmartMessage
 from pyrogram.enums import ChatMemberStatus
 from bot import dp, SmartPyro
@@ -152,11 +150,37 @@ from bot.helpers.logger import LOGGER
 from bot.helpers.notify import Smart_Notify
 from bot.helpers.buttons import SmartButtons
 from bot.helpers.defend import SmartDefender
-from config import LOG_CHANNEL_ID
-import os
+from config import LOG_CHANNEL_ID, FILE_API_URL
+import aiohttp
 
 logger = LOGGER
-BASE_URL = os.getenv("BASE_URL", "http://147.93.19.133:8000")
+
+async def check_api_health():
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            base_url = FILE_API_URL.rstrip('/')
+            async with session.get(f"{base_url}/") as response:
+                if response.status == 200:
+                    return True
+                else:
+                    return False
+    except:
+        return False
+
+async def get_telegram_file_id(message: Message):
+    if message.document:
+        return message.document.file_id
+    elif message.video:
+        return message.video.file_id
+    elif message.audio:
+        return message.audio.file_id
+    elif message.photo:
+        return message.photo[-1].file_id
+    elif message.video_note:
+        return message.video_note.file_id
+    else:
+        return None
 
 async def get_file_properties(message: Message):
     file_name = None
@@ -219,12 +243,20 @@ async def format_file_size(file_size: int):
         unit = "GB"
     return f"{size:.2f} {unit}"
 
+async def find_existing_message(code: str, limit: int = 100):
+    try:
+        async for message in SmartPyro.get_chat_history(LOG_CHANNEL_ID, limit=limit):
+            if message.caption == code:
+                return message.id
+    except Exception as e:
+        logger.error(f"Error searching for existing message: {e}")
+    return None
+
 async def handle_file_download(message: Message, bot: Bot):
-    user_id = message.from_user.id if message.from_user else None
     if not message.reply_to_message:
         await send_message(
             chat_id=message.chat.id,
-            text="<b>Please Reply To File For Link</b>",
+            text="<b>Please Reply To File For Link ❌</b>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -232,7 +264,7 @@ async def handle_file_download(message: Message, bot: Bot):
     if not (reply_message.document or reply_message.video or reply_message.photo or reply_message.audio or reply_message.video_note):
         await send_message(
             chat_id=message.chat.id,
-            text="<b>Please Reply To A Valid File</b>",
+            text="<b>❌ Only Video, Audio & Files are supported</b>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -242,68 +274,110 @@ async def handle_file_download(message: Message, bot: Bot):
         parse_mode=ParseMode.HTML
     )
     try:
+        api_is_running = await check_api_health()
+        if not api_is_running:
+            await bot.edit_message_text(
+                chat_id=processing_msg.chat.id,
+                message_id=processing_msg.message_id,
+                text="<b>Sorry File To Link Api Is Offline ❌</b>",
+                parse_mode=ParseMode.HTML
+            )
+            logger.error("API is offline, stopping process")
+            return
         bot_member = await SmartPyro.get_chat_member(LOG_CHANNEL_ID, "me")
         if bot_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-            await processing_msg.edit_text(
-                "<b>Error: Bot must be an admin in the log channel</b>",
+            await bot.edit_message_text(
+                chat_id=processing_msg.chat.id,
+                message_id=processing_msg.message_id,
+                text="<b>Error: Bot must be an admin in the log channel</b>",
                 parse_mode=ParseMode.HTML
             )
             return
-        code = f"{secrets.token_urlsafe(16)}-{user_id}"
+        bot_me = await bot.get_me()
+        bot_user_id = bot_me.id
+        telegram_file_id = await get_telegram_file_id(reply_message)
+        if not telegram_file_id:
+            await bot.edit_message_text(
+                chat_id=processing_msg.chat.id,
+                message_id=processing_msg.message_id,
+                text="<b>Error: Could not get file ID</b>",
+                parse_mode=ParseMode.HTML
+            )
+            return
         file_name, file_size, mime_type = await get_file_properties(reply_message)
-        file_id = None
-        if message.chat.id == LOG_CHANNEL_ID:
-            file_id = reply_message.message_id
-            sent = await SmartPyro.copy_message(
-                chat_id=LOG_CHANNEL_ID,
-                from_chat_id=LOG_CHANNEL_ID,
-                message_id=reply_message.message_id,
-                caption=code,
-                parse_mode=SmartParseMode.HTML
-            )
-            file_id = sent.id
+        code = f"{telegram_file_id}-{bot_user_id}"
+
+        existing_message_id = await find_existing_message(code)
+
+        if existing_message_id:
+            message_id = existing_message_id
+            logger.info(f"Found existing message for file_id: {telegram_file_id}, message_id: {message_id}")
         else:
-            sent = await reply_message.forward(LOG_CHANNEL_ID)
-            file_id = sent.message_id
-            sent = await SmartPyro.copy_message(
-                chat_id=LOG_CHANNEL_ID,
-                from_chat_id=LOG_CHANNEL_ID,
-                message_id=file_id,
-                caption=code,
-                parse_mode=SmartParseMode.HTML
-            )
-            file_id = sent.id
+            if message.chat.id == LOG_CHANNEL_ID:
+                sent = await SmartPyro.copy_message(
+                    chat_id=LOG_CHANNEL_ID,
+                    from_chat_id=LOG_CHANNEL_ID,
+                    message_id=reply_message.message_id,
+                    caption=code
+                )
+                message_id = sent.id
+            else:
+                sent = await reply_message.forward(LOG_CHANNEL_ID)
+                temp_id = sent.message_id
+                sent = await SmartPyro.copy_message(
+                    chat_id=LOG_CHANNEL_ID,
+                    from_chat_id=LOG_CHANNEL_ID,
+                    message_id=temp_id,
+                    caption=code
+                )
+                message_id = sent.id
+            logger.info(f"Created new message for file_id: {telegram_file_id}, message_id: {message_id}")
+
         quoted_code = urllib.parse.quote(code)
-        base_url = BASE_URL.rstrip('/')
-        download_link = f"{base_url}/dl/{file_id}?code={quoted_code}"
+        base_url = FILE_API_URL.rstrip('/')
+        download_link = f"{base_url}/dl/{message_id}?code={quoted_code}"
         is_video = mime_type.startswith('video') or reply_message.video or reply_message.video_note
-        stream_link = f"{base_url}/dl/{file_id}?code={quoted_code}=stream" if is_video else None
+        stream_link = f"{base_url}/dl/{message_id}?code={quoted_code}=stream" if is_video else None
         smart_buttons = SmartButtons()
-        smart_buttons.button("🚀 Download", url=download_link)
-        if stream_link:
-            smart_buttons.button("🖥️ Stream", url=stream_link)
-        keyboard = smart_buttons.build_menu(b_cols=2)
-        response = (
-            f"<b>✨ Your Links are Ready! ✨</b>\n\n"
-            f"<code>{file_name}</code>\n\n"
-            f"<b>📂 File Size:</b> <code>{await format_file_size(file_size)}</code>\n\n"
-            f"<b>🚀 Download Link:</b> <code>{download_link}</code>\n\n"
-        )
-        if stream_link:
-            response += f"<b>🖥️ Stream Link:</b> <code>{stream_link}</code>\n\n"
-        response += "<b>⌛️ Note: </b>\n<blockquote>Links remain active while the bot is running and the file is accessible.</blockquote>"
-        await processing_msg.edit_text(
+        if is_video:
+            smart_buttons.button("📥 Download", url=download_link)
+            smart_buttons.button("▶️ Stream", url=stream_link)
+            keyboard = smart_buttons.build_menu(b_cols=1)
+        else:
+            smart_buttons.button("📥 Download", url=download_link)
+            keyboard = smart_buttons.build_menu(b_cols=1)
+        if is_video:
+            response = (
+                f"<b>Video Name:</b> {file_name}\n"
+                f"<b>Size:</b> {await format_file_size(file_size)}\n\n"
+                f"<b>Download:</b> <code>{download_link}</code>\n\n"
+                f"<b>Stream:</b> <code>{stream_link}</code>\n\n"
+                f"<b>• Open in any browser or player.</b>\n"
+                f"<b>• Stream works on PC & Android browsers.</b>"
+            )
+        else:
+            response = (
+                f"<b>File Name:</b> {file_name}\n"
+                f"<b>File Size:</b> {await format_file_size(file_size)}\n\n"
+                f"<b>File Link:</b> <code>{download_link}</code>\n\n"
+                f"<b>Use the link to download the file directly.</b>"
+            )
+        await bot.edit_message_text(
+            chat_id=processing_msg.chat.id,
+            message_id=processing_msg.message_id,
             text=response,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
             disable_web_page_preview=True
         )
-        logger.info(f"Generated links for file_id: {file_id}, download: {download_link}, stream: {stream_link}")
+        logger.info(f"Generated links for message_id: {message_id}, telegram_file_id: {telegram_file_id}, download: {download_link}, stream: {stream_link}")
     except Exception as e:
-        logger.error(f"Error generating links for file_id: {file_id if 'file_id' in locals() else 'unknown'}, error: {str(e)}")
+        logger.error(f"Error generating links, error: {str(e)}")
         await Smart_Notify(bot, f"{BotCommands}fdl", e, processing_msg)
-        await processing_msg.edit_text(
-            f"<b>Error: Failed to generate link - {str(e)}</b>",
+        await bot.edit_message_text(
+            chat_id=processing_msg.chat.id,
+            message_id=processing_msg.message_id,
+            text=f"<b>❌ Only Video, Audio & Files are supported</b>",
             parse_mode=ParseMode.HTML
         )
 
