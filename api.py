@@ -11,7 +11,8 @@ from fastapi import FastAPI, HTTPException, Response, Request
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
 from telethon import TelegramClient
-from telethon.sessions import MemorySession
+from telethon.errors import FloodWaitError
+from telethon.sessions import SQLiteSession
 from telethon.tl.custom import Message
 
 try:
@@ -109,9 +110,9 @@ def get_file_properties(message: Message):
 
 class FileToLinkAPI(TelegramClient):
     def __init__(self, api_id, api_hash, bot_token):
-        LOGGER.info("Creating Telethon FileToLink Client From BOT_TOKEN with MemorySession")
+        LOGGER.info("Creating Telethon FileToLink Client From BOT_TOKEN with SQLiteSession at /tmp/telethon.session")
         super().__init__(
-            MemorySession(),
+            SQLiteSession("/tmp/telethon.session"),
             api_id,
             api_hash,
             connection_retries=-1,
@@ -124,9 +125,15 @@ class FileToLinkAPI(TelegramClient):
         self.semaphore = asyncio.Semaphore(self.max_concurrent)
 
     async def start_api(self):
-        await self.start(bot_token=self.bot_token)
-        LOGGER.info("Telethon FileToLink Client Created Successfully with MemorySession!")
-        LOGGER.info("FileToLinkAPI started with max concurrent requests: %s", self.max_concurrent)
+        while True:
+            try:
+                await self.start(bot_token=self.bot_token)
+                LOGGER.info("Telethon FileToLink Client Created Successfully with SQLiteSession!")
+                LOGGER.info("FileToLinkAPI started with max concurrent requests: %s", self.max_concurrent)
+                return
+            except FloodWaitError as e:
+                LOGGER.warning("FloodWait during startup: waiting %d seconds before retry", e.seconds)
+                await asyncio.sleep(e.seconds)
 
 async def get_local_ip():
     loop = asyncio.get_event_loop()
@@ -196,7 +203,7 @@ app = FastAPI(lifespan=lifespan, title="FileToLink")
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     try:
-        return templates.TemplateResponse("index.html", {"request": request})
+        return templates.TemplateResponse(request=request, name="index.html")
     except Exception as e:
         return HTMLResponse(content=f"<h1>FileToLink API</h1><p>Status: Running</p><p>Error loading template: {str(e)}</p>")
 
@@ -235,13 +242,16 @@ async def stream_file(file_id: int, request: Request):
         file_size_mb = f"{file_size / (1024 * 1024):.2f} MB"
 
         try:
-            return templates.TemplateResponse("player.html", {
-                "request": request,
-                "file_name": file_name,
-                "file_size_mb": file_size_mb,
-                "file_url": file_url,
-                "mime_type": mime_type
-            })
+            return templates.TemplateResponse(
+                request=request,
+                name="player.html",
+                context={
+                    "file_name": file_name,
+                    "file_size_mb": file_size_mb,
+                    "file_url": file_url,
+                    "mime_type": mime_type
+                }
+            )
         except Exception as e:
             return HTMLResponse(content=f"<h1>{file_name}</h1><p>Size: {file_size_mb}</p><a href='{file_url}'>Download</a>")
 
@@ -283,13 +293,16 @@ async def transmit_file(file_id: int, request: Request):
             file_size_mb = f"{file_size / (1024 * 1024):.2f} MB"
 
             try:
-                return templates.TemplateResponse("player.html", {
-                    "request": request,
-                    "file_name": file_name,
-                    "file_size_mb": file_size_mb,
-                    "file_url": file_url,
-                    "mime_type": mime_type
-                })
+                return templates.TemplateResponse(
+                    request=request,
+                    name="player.html",
+                    context={
+                        "file_name": file_name,
+                        "file_size_mb": file_size_mb,
+                        "file_url": file_url,
+                        "mime_type": mime_type
+                    }
+                )
             except Exception as e:
                 return HTMLResponse(content=f"<h1>{file_name}</h1><p>Size: {file_size_mb}</p><a href='{file_url}'>Download</a>")
 
